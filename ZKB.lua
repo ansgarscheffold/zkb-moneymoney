@@ -3,7 +3,7 @@
 -- Copyright 2024-2026 Ansgar Scheffold
 --------------------------------------------------------------------------------
 WebBanking{
-    version     = 1.05,
+    version     = 1.06,
     url         = "https://onba.zkb.ch",
     services    = {"Zürcher Kantonalbank"},
     description = "Abfrage des ZKB Kontos mit Foto-TAN-Authentifizierung"
@@ -105,19 +105,21 @@ local function parseAmount(str)
              :gsub("'", "")             -- Remove thousand separators
              :gsub(",", ".")            -- Convert comma to decimal point
              :gsub("CHF%s*", "")        -- Remove currency indicator
+             :gsub("EUR%s*", "")        -- Remove currency indicator
              :gsub("%s+", "")           -- Remove all spaces
     
     return tonumber(str) or 0
 end
 
 -- Split transaction text into title and purpose
+-- FIX: ZKB format is "Beschreibung: Titel" – part before separator is desc, part after is title
 local function splitTransactionText(text)
     -- First try to split by colon
-    local title, desc = text:match("^(.-):%s*(.+)$")
+    local desc, title = text:match("^(.-):%s*(.+)$")
     if title then return title, desc end
     
     -- Then try to split by comma
-    title, desc = text:match("^(.-),%s*(.+)$")
+    desc, title = text:match("^(.-),%s*(.+)$")
     if title then return title, desc end
     
     -- No separator found: entire text as title, empty description
@@ -352,7 +354,11 @@ function ListAccounts(knownAccounts)
         local accountUrl = section:match('<div%s+class="headerName">.-<a%s+href="([^"]+)"')
         local name       = section:match('<div%s+class="headerName">.-<a%s+href="[^"]+"[^>]*>(.-)</a>')
         local number     = section:match('<div%s+class="headerNumber">.-<a[^>]*>(.-)</a>')
-        local balance    = section:match('<div%s+class="headerWert">.-<a[^>]*>(.-)</a>')
+        -- Improved balance pattern to also capture the currency prefix (e.g. "EUR 1'234.56")
+        local balance    = section:match('<div%s+class="headerWert">[%s%S]-<a[^>]*>%s*<span[^>]*>([^<]+)</span>%s*</a>')
+                           or section:match('<div%s+class="headerWert">.-<a[^>]*>(.-)</a>')
+        -- Detect currency from the raw balance string (first 3 uppercase letters)
+        local currency   = balance and balance:match('^(%u%u%u)')
 
         -- Falls Saldo nicht im sichtbaren HTML steht: aus data-options JSON ziehen (falls vorhanden)
         if (not balance or balance == "") then
@@ -394,6 +400,12 @@ function ListAccounts(knownAccounts)
                 LocalStorage["kontoId_" .. cleanedNumber] = kontoId
             end
 
+            -- FIX: extract and persist depotId for depot accounts
+            local depotId = fullUrl:match("depotId=(%d+)")
+            if depotId then
+                LocalStorage["depotId_" .. cleanedNumber] = depotId
+            end
+
             local accountType = AccountTypeSavings
             if name:find("Girokonto") then
                 accountType = AccountTypeGiro
@@ -407,7 +419,8 @@ function ListAccounts(knownAccounts)
                 transactionsUrl = fullUrl,
                 kontoId = kontoId,
                 bankCode = "",
-                currency = "CHF",
+                -- FIX: use detected currency instead of hardcoded "CHF"
+                currency = currency or "CHF",
                 type = accountType
             })
         end
@@ -424,11 +437,19 @@ end
 -- Refresh account transactions
 function RefreshAccount(account, since)
     local kontoId = account.kontoId or LocalStorage["kontoId_" .. account.accountNumber]
-    if not kontoId then
-        error("No kontoId found for account " .. account.accountNumber)
+    -- FIX: also check for depotId so depot accounts don't crash with "No kontoId found"
+    local depotId = account.depotId or LocalStorage["depotId_" .. account.accountNumber]
+
+    if not kontoId and not depotId then
+        error("Neither kontoId nor depotId found for account " .. account.accountNumber)
     end
-    
-    local transactionsUrl = HomePage() .. "/page/kontozahlungen/konto.page?dswid=2820&kontoId=" .. kontoId .. "&activeTabId=kontoauszug&hn=1"
+
+    local transactionsUrl
+    if depotId then
+        transactionsUrl = HomePage() .. "/page/depotboersenhandel/depot.page?dswid=2820&depotId=" .. depotId .. "&activeTabId=depotauszug&hn=1"
+    else
+        transactionsUrl = HomePage() .. "/page/kontozahlungen/konto.page?dswid=2820&kontoId=" .. kontoId .. "&activeTabId=kontoauszug&hn=1"
+    end
     updateHeadersFromCookies()
     
     local response = connection:request("GET", transactionsUrl, nil, nil, headers)
@@ -437,8 +458,23 @@ function RefreshAccount(account, since)
     end
     
     -- Extract current balance
-    local balanceExtract = response:match('<span%s+class="font%-size%-24%s+nospace">%s*<span>CHF%s*([^<]+)</span>') or
-                           response:match('<span%s+class="saldo%s+ng%-binding%s+ng%-scope"[^>]*>CHF%s*([^<]+)</span>')
+    -- FIX: use account.currency dynamically instead of hardcoded "CHF"
+    local currency = account.currency or "CHF"
+
+    local balanceExtract =
+        response:match(
+            '<span%s+class="font%-size%-24%s+nospace">[%s%S]-<span>%s*<span[^>]*>' ..
+            currency .. '[%s\194\160]*([^<]+)</span>')
+        or response:match(
+               '<span%s+class="font%-size%-24%s+nospace">%s*<span>' ..
+               currency .. '%s*([^<]+)</span>')
+        or response:match(
+               '<span%s+class="saldo%s+ng%-binding%s+ng%-scope"[^>]*>' ..
+               currency .. '%s*([^<]+)</span>')
+        or response:match(
+               '<span%s+class="font%-size%-24"[^>]*>' ..
+               currency .. '[%s\194\160]+([^<]+)</span>')
+
     local balance = balanceExtract and parseAmount(balanceExtract) or (account.balance or 0)
     
     -- Extract transactions table
@@ -492,7 +528,7 @@ function RefreshAccount(account, since)
             name = transTitle,
             purpose = transPurpose,
             amount = amount,
-            currency = "CHF",
+            currency = currency,
             booked = booked
         })
         
@@ -561,7 +597,7 @@ function RefreshAccount(account, since)
                                     name = "Belastung Dauerauftrag",
                                     purpose = name,
                                     amount = amt,
-                                    currency = "CHF",
+                                    currency = currency,
                                     booked = booked
                                 })
                             end
